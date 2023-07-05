@@ -1,0 +1,964 @@
+---
+title: "PrincipalMicrobialGroups"
+author: "Luis Vidal Jordi"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE, warning=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(reactable)
+library(DT)
+library(tidyverse)
+library(factoextra)
+library(ggplot2)
+library(readr)
+library(compositions)
+library(zCompositions)
+library(robCompositions)
+library(caret)
+if(!requireNamespace("BiocManager")){
+  install.packages("BiocManager")
+}
+```
+
+En este RMarkdown se expone con detalle todo el código que hay detrás de la creación de los Principal Microbial Groups, con ligeras modificaciones que se han ido introduciendo respecto al original. Se recomienda leer el capítulo 2 antes o durante la lectura de este documento.
+# Principal MIcrobial Groups.
+
+## Base de Datos.
+Trabajaremos con la siguiente tabla de datos 
+
+```{r}
+tax_otu <- read.table('data/processed_taxatable.txt', sep="\t",header = TRUE)
+#DT::datatable(tax_otu, class = 'cell-border stripe',options = list(pageLength = 5))
+reactable(tax_otu, bordered = TRUE, highlight = TRUE, striped = TRUE, wrap = FALSE)
+labels <- read.table('data/task-healthy-cirrhosis.txt', sep="\t",header = FALSE)
+DT::datatable((labels), class = 'cell-border stripe',options = list(pageLength = 5))
+```
+
+El dataset consta de 130 muestras, de las cuales 62 corresponden a pacientes con cirrosis y las 68 restantes a pacientes sanos. Está constituido por 2145 variables, que representan los microorganismos en estudio. Al conjunto de taxonomía en estudio se le denomina *OTU* (*Operational Taxonomic Unit*). Los valores del interior de la tabla de datos representan los conteos de cada uno de los microorganismos en cada una de las muestras. De esta manera cada muestra (fila) es una composición de OTUs.
+
+## Pre-Procesamiento.
+Primero nos centraremos en el pre-procesamiento de los datos. El objetivo es convertir la tabla de datos original en una con la que podamos trabajar adecuadamente.
+
+Para ello crearemos un *objeto filogenético* mediante la librería *phyloseq*:
+```{r, warning=FALSE}
+library(phyloseq)
+```
+
+Estos objetos suelen contener un tabla *otu_table()* que contiene los conteos de cada muestra, una *tax_table()* que almacena la identificación taxonómica a diferentes niveles de cada OTU, y también una tabla *sample_data()* donde encontramos la variable de perfil asociada a cada muestra. En nuestro caso, cirróticos o no cirróticos (sanos). 
+
+```{r}
+#Creamos los componentes del objeto filogenético
+OTU<-otu_table(tax_otu[,-(1:7)], taxa_are_rows=TRUE) # OTUs(taxa) x muestras
+TAX<-tax_table(as.matrix(tax_otu[,1:7]))
+SAMPLEDATA<-sample_data(as.data.frame(labels)) #variable de perfil
+taxa_names(OTU)<-taxa_names(TAX)
+sample_names(OTU)<-sample_names(SAMPLEDATA)
+
+#Creamos el objeto
+cir<- phyloseq(OTU,TAX,SAMPLEDATA)
+```
+
+Los datos contienen 2145 OTUs. Sin embargo, la mayoría presentan una gran cantidad de ceros en muchas muestras. Se considera la presencia de dichos OTUs no es relevantes a la hora de inferir si un paciente padece o no la enfermedad. Por esto, eliminamos los OTUs (variables) que no contengan al menos 20 conteos en el 30% de las muestras. Al haber creado el objeto filogenético podemos hacerlo fácilmente mediante la siguiente instrucción:
+
+```{r}
+# Objeto filogenético con el primer filtrado
+cir2 <-  filter_taxa(cir, function(x) sum(x > 20) > (0.3*length(x)), TRUE) 
+```
+
+De aquí podemos extraer la tabla de conteos filtrada,
+```{r}
+OTU<-t(as.data.frame(otu_table(cir2)))  # Tabla de conteos:
+                                        #filas -> muestras
+                                        #columnas -> OTUs.
+str(OTU)
+reactable(OTU, bordered = TRUE, highlight = TRUE, striped = TRUE)
+```
+que ahora consta de 385 OTUs en estudio.
+
+Por otro lado, también extraemos los identificadores de los OTUs (tax_table):
+```{r}
+TAX<-as.data.frame(tax_table(cir2))
+TAX$otuid<-rownames(TAX)
+```
+
+A las etiquetas que contienen la variable de perfil les añadimos una columna que contiene el valor 0 si la muestra corresponde a un paciente sano y 1 si el paciente padece la enfermedad. Para ello se utiliza la función *grepl(patron,lista)* que devuelve una lista lógica que contiene *TRUE* por cada elemento que coincide con el patrón (carácter) y *FALSE* en caso contrario. 
+```{r}
+SAMPLEDATA$Label<-ifelse(grepl("Cirrhosis", SAMPLEDATA$V2), 1, 0)
+names(SAMPLEDATA)<-c("sampleID","Status","Label") #Identificadores de las columnas
+reactable(SAMPLEDATA, bordered = TRUE, highlight = TRUE, striped = TRUE)
+```
+
+Ya estamos cerca de obtener la tabla con la trabajaremos. Pero, uno de los aspectos más importantes de los datos composicionales es que estos no pueden contener ceros. Para ello se aplica la siguiente función (del paquete *zCompositions*), que además de imputar los ceros, por defecto realiza la clausura a la tabla resultante:
+
+```{r,warning=FALSE,message=FALSE}
+library(zCompositions)
+```
+
+```{r}
+otu.no0<-cmultRepl(OTU) 
+#si quisieramos mantener los conteos añadiríamos: output = "p-counts"
+```
+La metodología que utiliza la función se basa en un método bayesiano, explicado brevemente en la memoria.
+
+## Agregación a nivel de género.
+Notemos que no todos los microorganismos en estudio están identificados al mismo nivel taxonómico. Normalmente, al realizar estudios de este tipo, se suelen agregar los OTUs a cierto nivel taxonómico como, por ejemplo, a nivel de género. 
+
+La librería *microbiome* nos permite hacer esto fácilmente sobre objetos filogenéticos.
+```{r,warning=FALSE,message=FALSE}
+#install_github("microbiome/microbiome")
+library(microbiome)
+```
+
+```{r}
+cir.genus <- aggregate_taxa(cir2, 'g') #g indical nivel de género
+g_OTU<-t(as.data.frame(otu_table(cir.genus))) #taxa x muestras
+g_otu.no0<-cmultRepl(g_OTU)
+```
+```{r,message=FALSE,echo=FALSE}
+rm(g_OTU)
+```
+
+Un detalle importante es que los microorganismos no tienen porque estar clasificados al mismo nivel. De hecho, bastantes OTUs solo están clasificados hasta cierto nivel taxonómico, y en algunos casos no están clasificados hasta nivel de género. En estas situaciones la función crea una etiqueta específica para este OTU. Por ejemplo:
+```{r}
+print(names(g_otu.no0[,1:7]))
+```
+la columna 7 representa un microorganismo que solo ha sido clasificado hasta nivel de clase.
+
+
+
+## Creación de PMGs.
+Los PMGs se presentan como una alternativa a otras técnicas de reducción de dimensión como la agregación taxonómica. Por eso procederemos con la tabla sin agregar. 
+```{r}
+X <- otu.no0
+reactable(X, bordered = TRUE, highlight = TRUE , wrap = FALSE, striped = TRUE)
+```
+
+Como se explica en la memoria, estamos ante unos datos que presentan el inconveniente de tener más variables que observaciones. El objetivo es crear grupos de variables no sobrepuestos, llamados *Principal Microbial Groups*. El método para conseguir esto se sustenta en la elección de *Balances Principales*. En este, creamos balances principales de las partes composicionales mediante un proceso SBP y de manera análoga a cuando se hace ACP, se escoge un número de balances principales concreto (los que más variabilidad recogen). Los balances seleccionados establecerán cómo se forman los grupos.
+
+Para crear un sistema de balances principales mediante un proceso SBP necesitamos establecer un criterio de creación de grupos. Para esto, se realiza un *clustering de variables* o *clustering Q-mode*.
+
+### Clustering Q-mode.
+Para llevar a cabo el clustering necesitamos establecer como medir la similaridad entre las variables (partes composicionales). De acuerdo con lo expuesto en la memoria se utiliza la matriz de variación, que definimos como
+
+```{r}
+#función de creación propia
+mvariation <- function(x, optor = "none"){
+  if(is.null(dim(x)) ){x=t(as.matrix(x))}
+  D = ncol(x)
+  d = 
+  T = matrix(rep(0,D*D), ncol = D, nrow = D)
+  for (i in 1:D) {
+    for (j in 1:i) {
+      T[i,j] = var(log(x[,i]/x[,j]))
+      T[j,i] = T[i,j]
+    }
+  }
+  colnames(T) <- colnames(x)
+  rownames(T) <- colnames(x)
+  return(T)
+}
+```
+
+
+```{r}
+T <- mvariation(X) 
+```
+
+En la memoria se muestra que la matriz de variación es el cuadrado de la distancia de Aitchison entre partes composicionales, con lo que utilizaremos $\sqrt{T}$ como matriz de distancias en el clustering. Como método de *linkage* escogemos el de Ward, para garantizar que el sistema de balances creado proporcione balances principales.
+
+```{r}
+clust <- hclust(as.dist(sqrt(T)), method = "ward.D2")
+```
+
+De este clustering nos interesa especialmente la *Matriz Merge*, que nos indica como se han ido formando los grupos en el clustering.
+
+```{r}
+head(clust$merge)
+```
+Cada fila de la matriz representa la unión entre partes composicionales o grupos de estas. Los valores negativos representan observaciones (variables) individuales y los valores positivos representan grupos ya formados. Por ejemplo, la primera fila nos indica que en la primera iteración se unen el OTU87 y el OTU192. Por otro lado, la quinta fila nos indica que el OTU165 se une al grupo formado en la iteración 1. 
+
+Traduciremos esta información en una *Matriz Signo* mediante la siguiente función
+```{r}
+mmerge2sign<-function(Merge){
+  V = matrix(0, ncol = nrow(Merge) + 1, nrow = nrow(Merge))
+  for (i in 1:nrow(Merge)) {
+    for (j in 1:2) {
+      weight = (-1)^j
+      k = Merge[i, j]
+      if (k < 0) {
+        V[i, abs(k)] = weight
+      }
+      if (k > 0) {
+        take = as.logical(V[k, ]) 
+        V[i, take] = rep(weight, sum(take))
+      }
+    }
+  }
+  revV = V[nrow(V):1,]
+  return(t(revV))
+}
+
+MatrizSigno <- mmerge2sign(clust$merge) 
+```
+
+Esta función tiene como entrada la matriz merge del clustering. Se crea una matriz $V_{384 \times 385}$. Cada fila representa una unión entre grupos (384 uniones) y las columnas representan las partes composicionales. Entonces, como cada fila representa una unión entre dos grupos, se asigna -1 en las columnas correspondientes a uno de estos y 1 las del otro. De esta manera, como en la primera unión solo se unen las variables (partes) 87 y 192, la primera fila de *V* contiene -1 y en la columna 87 y 1 en la 192. Se realiza esto en todas las filas y al acabar el proceso se revierte y transpone *V*. Esto es equivalente a seguir las uniones en orden inverso:
+Al revertir, la última fila es la que muestra como se unen los OTUs 87 y 192; y la primera, muestra la última iteración del clustering, en la que todas variables quedan unidas en el mismo grupo (esa fila queda llena de 1 y -1, ya que todas las partes están involucradas). 
+Al trasponer intercambiamos filas y columnas, quedándonos de la siguiente manera:
+```{r,warning=FALSE}
+reactable(MatrizSigno, bordered = TRUE, striped = TRUE)
+```
+
+
+Con esto ya tenemos un criterio de selección de grupos que nos permite realizar un proceso SBP de balances principales. Ya que, como se expone en la memoria, la primera iteración del SBP corresponde al último paso del clustering. Como es este donde se unen los grupos menos parecidos, el balance entre estos será el que mayor variabilidad recoja.
+
+Ya podemos establecer las coordenadas ilr (balances). Estas se calculan fácilmente si disponemos de la matriz de contraste, la cual contiene los clr de los elementos base de nuestro sistema de balances. De acuerdo con la teoría, es fácil de construir si disponemos del orden en que se van desagrupando las partes, que es precisamente lo que nos indica la matriz signo.
+```{r}
+#función de creación propia
+mcontraste <- function(MS){
+  MC <- matrix(0,ncol = ncol(MS), nrow = nrow(MS))
+  for (j in 1:ncol(MC)) {
+    Pos = (MS>0)
+    Neg = (MS<0)
+    r = length(which(Pos[,j]))
+    s = length(which(Neg[,j]))
+    
+    MC[Pos[,j],j] = (1/r)*(sqrt(r*s/r+s))
+    MC[Neg[,j],j] = (-1/s)*(sqrt(r*s/r+s))
+    norma <- norm(MC[,j])
+    MC[,j] <- MC[,j]/norma
+    
+  }
+  
+  return(MC)
+}
+MC = mcontraste(MatrizSigno)
+rownames(MC) = colnames(X)
+
+reactable(MC,wrap = FALSE, striped = TRUE, bordered = TRUE)
+```
+La matriz de contraste contiene los *clr* de los vectores base (ortonormales) del sistema de balances (*ilr*). De acuerdo con la geometría de Aitchison:
+$$ \langle e_i,e_j \rangle_a = \langle clr(e_i),clr(e_j) \rangle = 0 $$
+con lo que podemos comprobar con el producto escalar que esto se satisface la condición de ortogonalidad
+```{r}
+#función de creación propia
+prod.escalar <- function(x,y){
+  suma = 0
+  for (i in 1:length(x)) {
+    suma = suma + x[i]*y[i]
+  }
+  return(suma)
+}
+checkortogonalidad <- function(MC){
+  indicador = TRUE
+  for (i in 2:ncol(MC)) {
+    for (j in 1:(i-1)) {
+      if (round(prod.escalar(MC[,i],MC[,j]),14) != 0){indicador = FALSE}
+    }
+  }
+  return(indicador)
+}
+checkortogonalidad(MC)
+```
+Así, mediante la matriz de contrastes podemos calcular los balances (coordenadas ILR respecto la base mencionada), como
+
+$$\text{ilr}(X) = \text{clr}(X) \cdot V $$
+
+```{r, warning= FALSE}
+mclr <- function(x){
+  if(is.null(dim(x)) ){x=t(as.matrix(x))}
+  logx = log(x)
+  rs = outer(rowSums(logx),rep((1/ncol(x)),length=(ncol(x))))
+  xclr=logx-rs
+  return(xclr)
+}
+
+#función de creación propia
+ILR <- function(X,V){
+  coordilr <- (as.matrix(mclr(X))) %*% V
+  return(coordilr)
+}
+ilr <- ILR(X,MC)
+reactable(ilr, bordered = TRUE, highlight = TRUE , wrap = FALSE)
+```
+
+Ahora fijaremos un número de grupos (PMGs) a crear para entender mejor el proceso y posteriormente realizaremos un bucle para encontrar el número óptimo de grupos.
+
+### Creación de *n* PMGs.
+
+Para faciltar el seguimiento del código, agrupamos todo el proceso de construcción de la matriz de contraste mediante la siguiente función:
+
+```{r}
+mPBclustvar<-function(x){
+  # Matriz de variación como distancia
+  hdist = sqrt(mvariation(x))
+  hdist=as.dist(hdist)
+  # Clustering
+  hmerge<-hclust(d=hdist,method="ward.D2")
+  
+  # Matriz Signo a partir de Merge
+  Vsigns=mmerge2sign(hmerge$merge)
+  # Matriz de Contraste 
+  V = mcontraste(Vsigns)
+  rownames(V)=colnames(x)
+  return(V)
+}
+#La salida es la matriz de contraste MC
+```
+
+Supongamos que queremos crear 15 PMGs.
+```{r}
+numgrupos = 15
+numberofgroup = numgrupos
+```
+
+El primer paso es escoger que OTUs formaran cada grupo. Esto se realiza mediante la siguiente función:
+```{r}
+groupOTUs <- function(X,numberofgroup) {
+  groupnames<<-rev(paste0("G",1:numberofgroup)) 
+  V<- mPBclustvar(X) # Matriz de contraste
+  coord<-ILR(X,V) #Coordenadas ILR
+  
+  # Recuperamos matriz signo de los n-1 balances principales
+  tempV<-V[,1:numberofgroup-1]
+  s<-as.data.frame(sign(tempV))
+  # y le añadimos una columna vacía donde se indicará el PMG asignado 
+  # a cada OTU (fila)
+  s$group<-NA
+  
+  # Esta función es la que realiza la asginación de grupos
+  s<-processColumns(s,numberofgroup)
+  
+  OTUsGroups<- cbind(rownames(s),s$group)
+  colnames(OTUsGroups)<-c("otuid","group")
+  OGT<-merge(OTUsGroups,TAX, by="otuid") 
+  return(OGT)
+}
+```
+
+Esta función tiene como entradas
+
+* *X* la matriz de datos,
+* *numberofgroup* el número de grupos a crear.
+
+Para crear los grupos, la función selecciona los $n-1 = 14$ *balances principales* que corresponden a las $n-1$ primeras columnas de la matriz de contraste. A su vez, recupera la matriz signo correspondiente a estas $n-1$ columnas y la convierte en un dataframe con una columna extra al final en la que iremos asignando el grupo al que corresponde cada OTU (recordemos que cada fila de la matriz de contraste representa un OTU y cada columna representa uno de los balances). De esta manera, el dataframe creado tiene por filas los OTUs y $n-1$ columnas que indican que OTUs (filas) participan en cada balance.
+
+```{r}
+groupnames<<-rev(paste0("G",1:numberofgroup))
+tempV<-MC[,1:numgrupos-1]
+s<-as.data.frame(sign(tempV))
+s$group<-NA
+DT::datatable(s, class = 'cell-border stripe',options = list(pageLength = 5))
+```
+
+A continuación en *groupOTUs* se llama a la funcion *processColumns*:
+```{r}
+processColumns<-function(s,numberofgroup){
+  for(i in rev(c(1:(numberofgroup-1)))){
+    #print("---PROCESSING---")
+    #print(i)
+    if(i==(numberofgroup-1)){
+      
+      s[which(s[,i]<0),]$group <- groupnames[1]
+      #print(groupnames[1])
+      groupnames<<-groupnames[-1]
+      # print("---group created---")
+      s[which(s[,i]>0),]$group <- groupnames[1]
+      #print(groupnames[1])
+      groupnames<<-groupnames[-1]
+      #print("---group created---")
+    }
+    
+    else{
+      flag<-CheckPrevColsPOSorNEG0(s,i)
+      if(length(unique(flag[,1]))==1 && unique(as.list(flag[,1]))==TRUE){
+        s[which(s[,i]>0),]$group <- groupnames[1]
+        #print(groupnames[1])
+        groupnames<<-groupnames[-1] 
+      }
+      if(length(unique(flag[,2]))==1 && unique(as.list(flag[,2]))==TRUE){
+        
+        s[which(s[,i]<0),]$group <- groupnames[1]
+        #print(groupnames[1])
+        groupnames<<-groupnames[-1] 
+      }
+    }
+  }
+  return(s)
+}
+```
+
+Esta recibe como entrada
+
+* El dataframe *s* anterior,
+* El número de grupos a crear.
+
+La función *processColumns* es la que se encarga de asignar a cada una de las partes composicionales (filas) un grupo (PMG). Para hacerlo, recorre todas las columnas, empezando por la última, y procede de la siguiente manera:
+
+En cada columna, asigna un grupo a las variables con un -1 y otro grupo a las variables con 1. Pero, siempre y cuando, no tengan asignado ya un grupo. Es decir, a una fila (parte/variable) se le asigna un PMG siempre cuando en todas las anteriores columnas solo haya ceros, ya que en caso contrario tendría un grupo asignado. 
+
+Para comprobar esto, en cada columna, llama a la siguiente función:
+
+```{r}
+# La entrada es la matriz s (matriz signo de los balances principales) y la columna
+# en la que se esta asignando grupos
+
+CheckPrevColsPOSorNEG0<-function(M,colno){
+  pos_prevflag<-NULL
+  neg_prevflag<-NULL
+  
+  POS<-which(M[,colno]>0) # Vector lógico que indica las posiciones pos
+  NEG<-which(M[,colno]<0) # Vector lógico que indica las posiciones neg
+  
+  collist<-c((colno+1):(ncol(M)-1)) #Lista de columnas por comprobar (anteriores a la actual)
+  
+  for(i in collist) {
+    if (length(unique(M[POS,i])) < 2 )  { # Las filas de los POS solo contienen ceros
+      pos_prevflag<- c(pos_prevflag,TRUE) 
+    }else{
+      pos_prevflag<- c(pos_prevflag,FALSE) # Hay algun 
+    }
+    
+  }
+  for(i in collist) {
+    
+    if (length(unique(M[NEG,i])) < 2 )  { # NEG rows on colno is All 0's
+      neg_prevflag<- c(neg_prevflag,TRUE) #If all prev cols 0.
+    }else{
+      neg_prevflag<- c(neg_prevflag,FALSE) ##need to change column
+    }
+  }
+  prevflag<-cbind(pos_prevflag,neg_prevflag)
+  return(prevflag)
+}
+```
+
+Veamos como funcionan las primeras iteraciones de *processColums*:
+
+Primero se asignan grupos para la última columna:
+```{r}
+groupnames<-rev(paste0("G",1:numberofgroup)) %>% print()
+i = numgrupos - 1 #Columna 14
+
+# G15 a las filas de la columna 14 que tengan -1
+s[which(s[,i]<0),]$group <- groupnames[1]
+# Eliminamos G15 de los disponibles
+groupnames<-groupnames[-1] 
+
+# G14 a las filas de la columna 14 que tengan 1
+s[which(s[,i]>0),]$group <- groupnames[1]
+# Eliminamos G14 de los disponibles
+groupnames<-groupnames[-1]
+
+DT::datatable(s, class = 'cell-border stripe',options = list(pageLength = 5))
+```
+
+Una vez procesada la última columna pasamos a la siguiente (columna 13). El aviso de *CheckPrevColsPOSorNEG0* viene dado por:
+
+```{r}
+flag <- CheckPrevColsPOSorNEG0(s,13)
+print(flag)
+```
+Este nos indica que, tanto las filas con 1 como las que tienen -1 en la anterior columna contienen ceros. Es decir, no tienen grupo asignado y entonces les podemos asignar grupo en la iteración actual:
+
+```{r}
+i = 13
+if(length(unique(flag[,1]))==1 && unique(as.list(flag[,1]))==TRUE){
+  s[which(s[,i]>0),]$group <- groupnames[1]
+  #print(groupnames[1])
+  groupnames<-groupnames[-1] 
+}
+if(length(unique(flag[,2]))==1 && unique(as.list(flag[,2]))==TRUE){
+      
+  s[which(s[,i]<0),]$group <- groupnames[1]
+  #print(groupnames[1])
+  groupnames<-groupnames[-1] 
+}
+```
+
+Ahora se pueden ver filas (OTUs) con asignaciones G12,G13,G14 y G15:
+
+```{r}
+DT::datatable(s, class = 'cell-border stripe',options = list(pageLength = 5))
+```
+
+
+Después de la iteración, solo quedan los siguientes grupos por asignar.
+
+```{r}
+print(groupnames)
+```
+
+Se repite el proceso para la columna 12:
+
+```{r}
+i=12
+# se actualiza el aviso
+flag <- CheckPrevColsPOSorNEG0(s,i)
+print(flag)
+```
+Ahora el aviso tiene dos filas (una para cada columna anterior). En este caso se indica que en ninguna de las dos hay 1 o -1 en las filas donde si los hay en la columna 11. Entonces, actualizamos grupos:
+
+```{r}
+if(length(unique(flag[,1]))==1 && unique(as.list(flag[,1]))==TRUE){
+  s[which(s[,i]>0),]$group <- groupnames[1]
+  #print(groupnames[1])
+  groupnames<-groupnames[-1] 
+}
+if(length(unique(flag[,2]))==1 && unique(as.list(flag[,2]))==TRUE){
+      
+  s[which(s[,i]<0),]$group <- groupnames[1]
+  #print(groupnames[1])
+  groupnames<-groupnames[-1]
+}
+DT::datatable(s, class = 'cell-border stripe',options = list(pageLength = 5))
+```
+
+Y así seguimos hasta recorrer todas las columnas. El proceso completo para las 14 columnas da lugar a:
+```{r}
+# Recuperamos la matriz "s" limpia
+groupnames<-rev(paste0("G",1:numgrupos))
+tempV<-MC[,1:numgrupos-1]
+s<-as.data.frame(sign(tempV))
+s$group<-NA
+
+# La matriz con todos los grupos asignados 
+s_15 <- processColumns(s,numgrupos)
+DT::datatable(s_15, class = 'cell-border stripe',options = list(pageLength = 5))
+```
+
+Una vez ya conocemos que OTUs formaran parte de cada grupo, se crea una tabla de PMGs. Es decir, nuestras partes composicionales ahora serán los PMGs. El valor asignado en los PMGs, para cada muestra, será la media geométrica de los OTUs del PMG (en dicha muestra). Para esto:
+
+```{r}
+OGT<-groupOTUs(X,numberofgroup)
+PMGs<-as.data.frame((matrix(ncol=numberofgroup,nrow=nrow(X))))# Data frame vacío de PMGS
+groupnames<-(paste0("G",1:numberofgroup))
+colnames(PMGs) <- groupnames
+for(i in c(1:length(groupnames)))
+{
+  if(ncol(as.data.frame(X[,OGT$otuid[OGT['group'] == groupnames[i]]]))==1) # Si el PMG solo tiene un elemento
+  {PMGs[,i] <- (X[,OGT$otuid[OGT['group'] == groupnames[i]]])}  # Su valor representa al PMG
+  
+  else{
+    PMGs[,i] <- geometricmeanRow(X[,OGT$otuid[OGT['group'] == groupnames[i]]])} # Calculamos la media geom
+}
+```
+
+Y la tabla con 15 PMGs queda:
+
+```{r}
+reactable(PMGs, bordered = TRUE, highlight = TRUE , wrap = FALSE)
+```
+
+Esta tabla contiene datos composicionales. Es decir, podemos aplicar la clausura para que todas las filas sumen 1 (aunque el estudio no se ve alterado si no lo hacemos - invarianza por escala). 
+
+Todo el proceso explicado hasta ahora se resume en la siguiente función, que tiene autocontenidas todas las expuestas hasta ahora:
+```{r}
+createPMGs <- function(X,numberofgroup) {
+  library(compositions)
+  OGT<<-groupOTUs(X,numberofgroup)
+  PMGs<-as.data.frame((matrix(ncol=numberofgroup,nrow=nrow(X))))# Data frame vacío de PMGS
+  groupnames<-(paste0("G",1:numberofgroup))
+  colnames(PMGs) <- groupnames
+  for(i in c(1:length(groupnames)))
+  {
+    if(ncol(as.data.frame(X[,OGT$otuid[OGT['group'] == groupnames[i]]]))==1) # Si el PMG solo tiene un elemento
+    {PMGs[,i] <- (X[,OGT$otuid[OGT['group'] == groupnames[i]]])}  # Su valor representa al PMG
+  
+    else{
+      PMGs[,i] <- geometricmeanRow(X[,OGT$otuid[OGT['group'] == groupnames[i]]])} 
+    # Calculamos la media geométrica
+  }
+  return(PMGs)
+}
+```
+
+### Búsqueda del número óptimo de PMGs.
+
+El siguiente paso es hallar el número óptimo de PMGs. Es decir, con cuántos grupos clasificamos mejor nuestras muestras.
+
+Para esto realizaremos un bucle entre un número mínimo y máximo de PMGs e iremos evaluando la precisión de clasificación para cada uno de ellos.
+
+Como número máximo de grupos se escoge *la cantidad de balances cuyo valor es superior al de la media de estos*.
+Si se crearan más grupos que valores superiores a la media podríamos estar agrupando en un mismo grupo OTUs demasiado relevantes como para estar en el mismo PMG:
+
+```{r}
+findMaxNumOfGroups <- function(X){
+  V<- mPBclustvar(X)
+  coord<-ILR(X,V)
+  diag(var(coord))>mean(diag(var(coord)))
+  maxnumberofgroups <- as.data.frame((table(diag(var(coord))>mean(diag(var(coord))))["TRUE"]))[1,1] + 1
+  return(maxnumberofgroups)
+}
+maximo <- findMaxNumOfGroups(X) %>% print()
+```
+El número mínimo de grupos a escoger es arbitrario. El artículo propone que sea de *25 grupos*:
+
+```{r}
+min = 25
+```
+
+Para evaluar la precisión con la que podemos clasificar usando las tablas de PMGs se crean nuevamente unas coordenadas ilr, esta vez sobre la tabla de PMGs (es decir, balances de PMGs), y se crea un modelo de regresión logística binaria.
+
+Veamos como sería para una iteración concreta:
+```{r}
+num_auxiliar = 30
+PMGs_aux <- createPMGs(X,num_auxiliar)
+```
+
+Puesto que los PMGs contienen datos composicionales para poder aplicar regresión logística, necesitamos aplicar alguna de las transformaciones conocidas. Por esto, calculamos las coordenadas ilr de estos PMGs:
+```{r}
+V_aux <- mPBclustvar(PMGs_aux)
+coord_aux <- ILR(X = PMGs_aux, V = V_aux)
+```
+
+Añadimos la variable de perfil (sobre la cual clasificaremos):
+
+```{r}
+My_PMGs_aux <- cbind(as.data.frame(coord_aux),SAMPLEDATA$Status)
+names(My_PMGs_aux)[ncol(My_PMGs_aux)]<-"label" #cambiamos el nombre de la columna
+My_PMGs_aux$label<-as.factor(My_PMGs_aux$label)
+
+#Ya tenemos la tabla lista para aplicar regresión logística
+reactable(My_PMGs_aux, bordered = TRUE, highlight = TRUE , wrap = FALSE)
+```
+
+Para aplicar regresión logística y asegurarnos de estimar correctamente la precisión de clasificación se establece un método de control: *k-fold cross-validation*. En este caso, en cada iteración se realizarán 10 k-folds cv con $k=10$, es decir, ajustaremos 100 modelos:
+
+```{r}
+fit.control <- trainControl(method = "repeatedcv", number = 10, repeats = 10,summaryFunction = twoClassSummary, classProbs = TRUE,allowParallel = F)
+```
+
+Ajustamos los modelos:
+
+```{r, warning=FALSE}
+set.seed(1)
+ajuste_aux <- train(label ~ ., data = My_PMGs_aux , method = "glm", 
+                            family = "binomial", trControl = fit.control)
+```
+
+Como criterio de precisión de cada uno de los 100 modelos ajustados se utiliza el valor óptimo de las curvas ROC:
+```{r}
+reactable(ajuste_aux$resample, wrap = FALSE, bordered = TRUE)
+```
+
+Y como estimación de la capacidad predictiva de la iteración con 30 grupos se calcula la media de los 100 ajustes:
+
+```{r}
+mean(ajuste_aux$resample[,1])
+```
+Aunque podemos acceder directamente a este valor mirando *$results*:
+```{r}
+ajuste_aux$results["ROC"]
+```
+Con todo esto, solo queda realizar un bucle con todos los posibles números de PMGs entre el mínimo y el máximo:
+
+```{r, warning=FALSE}
+findOptimalNumOfGroups <- function(X,min){
+  library(dplyr) 
+  library(stringr) 
+  library(caTools) 
+  library(caret)
+  
+  maxnumberofgroups <- findMaxNumOfGroups(X)
+  minnumberofgroups <- min
+  
+  fit.control <- trainControl(method = "repeatedcv", number = 10, repeats = 10,
+                              summaryFunction = twoClassSummary, classProbs = TRUE, allowParallel = F)
+  
+  roc.valuesMin<-NULL
+  for(numberofgroup in c(minnumberofgroups:maxnumberofgroups)){
+    
+    matrixPMGs<-createPMGs(X,numberofgroup)
+    
+    V <- mPBclustvar(matrixPMGs)
+    coord<-ILR(matrixPMGs,V)
+    
+    mydataPGMs.ILR<-cbind(as.data.frame(coord),SAMPLEDATA$Status)
+    names(mydataPGMs.ILR)[ncol(mydataPGMs.ILR)]<-"label"
+    mydataPGMs.ILR$label<-as.factor(mydataPGMs.ILR$label)
+    set.seed(33)
+    fit.PMGbalance <- train(label ~ ., data = mydataPGMs.ILR, method = "glm", 
+                            family = "binomial", trControl = fit.control)
+    roc<-fit.PMGbalance$results[,"ROC"]
+    roc.valuesMin <- c(roc.valuesMin,roc)
+    print(numberofgroup)
+  }
+  
+  roc.values<<-roc.valuesMin
+  plot(roc.valuesMin,xlab=(c("Número de Grupos")),ylab="AUC", xaxt="n")
+  axis(1, at=1:((maxnumberofgroups-minnumberofgroups)+1), labels=c(minnumberofgroups:maxnumberofgroups))
+  
+  optimalNumberofGroup<-as.numeric(which.max(roc.values)) + (minnumberofgroups-1)
+  
+  print(paste0("Optimal Number of group is:",optimalNumberofGroup))
+  return(optimalNumberofGroup)
+}
+```
+
+
+```{r, warning=FALSE, cache=TRUE}
+rm(i,groupnames,s,tempV,PMGs)
+optimo <- findOptimalNumOfGroups(X,min)
+```
+
+
+Por tanto la tabla de PMGs resultante queda:
+
+```{r}
+PMGs <- createPMGs(X,optimo)
+PMGs <- cbind(as.data.frame(PMGs),SAMPLEDATA$Status)
+names(PMGs)[ncol(PMGs)]<-"label"
+PMGs$label<-as.factor(PMGs$label)
+reactable(PMGs,wrap = FALSE, bordered = TRUE, striped = TRUE)
+```
+
+
+# Aplicación de PMGs en la detección de BioMarcadores.
+
+```{r, warning=FALSE}
+library(coda4microbiome)
+```
+
+```{r, include=FALSE,message=FALSE, warning=FALSE}
+#PRE-PROCESAMIENTO
+tax_otu <- read.table('data/processed_taxatable.txt', sep="\t",header = TRUE) 
+tax<-tax_otu[,1:7]
+otu<-tax_otu[,-(1:7)]
+labels <- read.table('data/task-healthy-cirrhosis.txt', sep="\t",header = FALSE) 
+
+
+
+if(!requireNamespace("BiocManager")){
+  install.packages("BiocManager")
+}
+
+# Creando objeto filogenético
+OTU<-otu_table(otu, taxa_are_rows=TRUE) # taxas x samples
+TAX<-tax_table(as.matrix(tax))
+SAMPLEDATA<-sample_data(as.data.frame(labels)) ##variables perfil
+taxa_names(OTU)<-taxa_names(TAX)
+sample_names(OTU)<-sample_names(SAMPLEDATA)
+cir<- phyloseq(OTU,TAX,SAMPLEDATA)
+
+
+# Filtrado 
+cir2 <-  filter_taxa(cir, function(x) sum(x > 20) > (0.3*length(x)), TRUE)
+# Si no hay 20 conteos en al menos el 30% de los otu (individuos) elimino el bicho (fila)
+
+rm(otu,tax,labels)
+
+
+# Extrayendo datos filtrados del objeto filogenético
+OTU<-t(as.data.frame(otu_table(cir2))) # samples x taxas
+SAMPLEDATA$Label<-ifelse(grepl("Cirrhosis", SAMPLEDATA$V2), 1, 0)
+names(SAMPLEDATA)<-c("sampleID","Status","Label")
+TAX<-as.data.frame(tax_table(cir))
+TAX$otuid<-rownames(TAX)
+
+
+#Imputación de 0 y clausura.
+otu.no0<-cmultRepl(OTU) # samples x taxas
+
+########################################
+###   TABLAS A NIVEL DE GÉNERO
+########################################
+#install_github("microbiome/microbiome")
+library(microbiome)
+cir.genus <- aggregate_taxa(cir2, 'g')
+cir.genus1 <- aggregate_taxa(cir2, 's')
+g_OTU<-t(as.data.frame(otu_table(cir.genus)))#taxa x samples
+g_OTU1<-t(as.data.frame(otu_table(cir.genus1)))
+# Imputacion de ceros y clausura
+g_otu.no0<-cmultRepl(g_OTU)
+g_otu.no01<-cmultRepl(g_OTU1)
+```
+
+En esta sección se presenta el código utilizado en el capítulo 3 de la memoria, en el que se procede a tratar de evaluar los PMGs para la detección de biomarcadores. Para ello trabajaremos tanto con los datos utilizados para construir los PMGs, como con los datos agregados hasta nivel de género:
+
+```{r}
+X1 <- otu.no0 #sin agregar
+Xg <- g_otu.no0 #agregado a género
+Xs <- g_otu.no01 # agregado a especie
+```
+
+
+En el anterior Rmd se concluye que el número óptimo de PMGs es 27
+```{r}
+optimalNumberofGroup = optimo %>% print()
+```
+
+Y la tabla de PMGs junto a la variable de perfil
+
+```{r}
+PMGs <- createPMGs(X,optimalNumberofGroup)
+PMGs <- cbind(as.data.frame(PMGs),SAMPLEDATA$Status) #añadimos la variable de perfil
+names(PMGs)[ncol(PMGs)]<-"label"
+PMGs$label<-as.factor(PMGs$label)
+```
+
+Para contrastar el uso de PMGs en la identificación de biomarcadores utilizaremos el método de *Coda4Microbiome*. Consiste en una regresión logística sobre los logratios de las partes composicionales. Además esta añade una restricción llamada *elastic-net penalization*. Para más detalle consultar *Insertar Nombre del Trabajo*. 
+
+## 1. Modelo con los parámetros por defecto.
+
+La tabla de datos agregada a nivel de género viene dada por:
+```{r}
+Xgender <- cbind(as.data.frame(Xg),SAMPLEDATA$Status)
+names(Xgender)[ncol(Xgender)]<-"label"
+Xgender$label<-as.factor(Xgender$label)
+
+reactable(Xgender, searchable = TRUE,bordered = TRUE, highlight = TRUE, striped = TRUE, wrap = FALSE)
+```
+y la tabla de PMGs:
+```{r}
+reactable(PMGs, searchable = TRUE,bordered = TRUE, highlight = TRUE, striped = TRUE, wrap = FALSE)
+```
+
+### Modelo 1.1 - A nivel de género.
+
+El $\lambda$ por defecto es 1 vez la desviación típica y el $\alpha = 0.9$.
+```{r}
+modelo_genero1 = coda_glmnet(x = Xgender[,-ncol(Xgender)], y = Xgender[,ncol(Xgender)], showPlots = FALSE)
+```
+
+Como salida del modelo podemos visualizar los coeficientes del logcontraste significativos:
+```{r}
+modelo_genero1$`signature plot`
+```
+
+La magnitud de estos nos indican la contribución de cada variable (OTU) al modelo. En este caso los coeficientes negativos son aquellos significantes en personas cirróticas (rojo) y los positivos (azules) en personas sanas. 
+
+También podemos visualizar la capacidad discriminatoria del modelo mediante los gráficos:
+```{r}
+modelo_genero1$`predictions plot`
+```
+
+El modelo discrimina bastante bien las muestras procedientes de pacientes sanos y cirróticos. Sin embargo, cabe recalcar que estas predicciones se han hecho sobre los mismos datos utilizados para ajustar el modelo. 
+
+Para tratar de estimar el error de test podemos acceder a la media y desviación típica del AUC obtenido por validación cruzada:
+```{r}
+modelo_genero1$`mean cv-AUC`
+modelo_genero1$`sd cv-AUC`
+```
+
+### Modelo 1.2 - A nivel PMGs.
+
+```{r}
+modelo_PMGs1 = coda_glmnet(x = PMGs[,-ncol(PMGs)], y = PMGs[,ncol(PMGs)], showPlots = FALSE)
+```
+
+El balance seleccionado por el modelo es:
+```{r}
+modelo_PMGs1$`signature plot`
+```
+
+Observamos que este atribuye la selección de biomarcadores al balance (G14/G26).
+
+Veamos si la capacidad para discriminar es igual de válida que a nivel de género:
+```{r}
+modelo_PMGs1$`predictions plot`
+```
+
+Las distribuciones de las predicciones son bastante similares en ambos casos. Veamos la precisión estimada mediante validación cruzada:
+```{r}
+modelo_PMGs1$`mean cv-AUC`
+modelo_PMGs1$`sd cv-AUC`
+```
+
+Vemos que es ligeramente superior que a nivel de género. Con esto, podemos ver que el balance G14/G26 discrimina lo suficientemente bien como para que su análisis sea imprescindible para detectar o prevenir la enfermedad.
+
+Ambos resultados ofrecen visiones diferentes en cuanto a la interpretación de cuáles son los biomarcadores. 
+
+```{r}
+modelo_genero1$taxa.name
+```
+
+Esta es la taxonomía que selecciona el modelo a nivel de género como candidata a contener los biomarcadores. 
+De esta:
+
+* *g.Megasphaera, g.Veillonella, g.Lactobacillus* coinciden con la literatura como biomarcadores de cirrosis a nivel de género.
+
+* *g.Campylobacter* se reconoce como biomarcador de cirrosis, a diferencia de lo que presenta el modelo.
+
+* Por otro lado, el resto de taxa relacionada con no padecer cirrosis no está contrastada en la literatura.
+
+Estudiemos más de cerca el balance (G14/G26).
+
+El grupo G26 contiene la siguiente taxa (a nivel de especie)
+```{r}
+G26 <- OGT[which(as_factor(OGT$group) == "G26"),]
+unique(G26$s)
+```
+
+Vemos que contiene 7 únicas especies. Entre ellas, *Streptococcus_anginosus*, *Campylobacter_concisus* y *Veillonella_parvula* están específicamente consideradas como especies enriquecidas en personas cirróticas. Por otro lado, *Fusobacterium_periodonticum* no está relacionada a nivel de especie, pero si a nivel de género *s.Fusobacterium*. *Streptococcus_mutans* no está específicamente relacionada con cirrosis, pero *g.Streptococcus* si lo está a nivel de género (también a nivel de especie en otras situadas en *G11* y *G27*).
+
+El grupo G14, asociado a taxa disminuida en pacientes cirróticos, contiene las siguientes especies
+```{r}
+G14 <- OGT[which(as_factor(OGT$group) == "G14"),]
+unique(G14$s)
+```
+
+En este grupo hay 18 especies repartidas (a nivel de género) en *Bacteroides*, *Odoribacter*, *Parabacteroides*, *Coprobacter* y *Barnesiella*.
+
+*Bacteroides* está específicamente mencionado como OTU disminuido en pacientes cirróticos. Pasa lo mismo con *Odoribacter* y *Parabacteroide*. Por otro lado *Coprobacter* y *Barnesiella* no están identificados a nivel de género, pero provienen de la familia *f.Porphyromonadaceaa* que aparece disminuida en pacientes cirróticos (a nivel de familia).
+
+Podemos ver que, en general, G26 incluye especies enriquecidas en pacientes con cirrosis, mientras que G14 contiene especies con proporciones disminuidas en estos mismos, y dada la capacidad predictiva un estudio del balance G14/G26 puede aportar mucha información.
+
+## Modelo 1.3 - Reduciendo la penalización.
+
+En el artículo de PMGs, mediante otros métodos, se obtienen balances de grupos diferentes. Veamos si reduciendo la penalización aparece un balance con diferentes grupos.
+
+Reducimos la penalización general, y dejamos caer todo el peso de la regularización sobe la norma Lasso (para forzar la selección de grupos).
+```{r}
+modelo_PMGs2 <- coda_glmnet(x = PMGs[,-ncol(PMGs)], y = PMGs[,ncol(PMGs)], showPlots = FALSE, lambda = 0.2, alpha = 1) 
+#Menos penalización
+modelo_PMGs2$`signature plot`
+```
+
+Ahora el balance propuesto por el modelo es (G14,G23)/(G26,G3). Podemos ver que los dos grupos con mayor peso dentro del balance siguen siendo G26 y G14, pero ahora aparecen también G23 y G3. 
+
+Por un lado G23 esta compuesto por
+```{r}
+G23 <- OGT[which(as_factor(OGT$group) == "G23"),]
+unique(G23$s)
+```
+
+Observamos 7 especies provenientes de *g.Ruminococcus* , *g.Ruminiclostridium* (2), *g.Oscillibacter* , *g.Alistipes*, *g.Adlercreutzia* y *g.Anaeromassilibacillus*
+
+De estas, a nivel de género, *Ruminococcus*, *Alistipes* y *Oscillibacter* están identificadas como disminuidas en personas enfermas. Del resto, no hay mención a nivel de género; pero si de las familias de donde proceden.
+
+Por otro lado, G3
+```{r}
+G3 <- OGT[which(as_factor(OGT$group) == "G3"),]
+unique(G3$s)
+```
+
+Contiene esencialmente especies del género *Lactobacillus*, el cual aparece en altos niveles en pacientes cirróticos. Además, también hay menciones específicas de alots niveles *s.Lactobacillus_salivarius* en enfermos.
+
+Vemos que G3 contiene mayoritariamente especies mayormente enriquecidas en pacientes cirróticos, al contrario que G23, que contiene aquellas disminuidas. 
+
+Además la estimación del poder discriminatorio del balance (G14,G23)/(G26,G3):
+```{r}
+modelo_PMGs2$`predictions plot`
+```
+
+Con una estimación de clasificación ligeramente más alta que el modelo a nivel de género:
+```{r}
+modelo_PMGs2$`mean cv-AUC`
+modelo_PMGs2$`sd cv-AUC`
+```
+
+
+### Breve Conclusión.
+Principal Microbial Groups es un método para reducir la dimensión de los datos, que además ofrece la creación de grupos de taxa originales. En estos guardamos toda la información taxonómica, sin agregar a cierto nivel filogénetico, lo que nos permite tener una visión diferente de los balances a tener en cuenta para detectar biomarcadores. En general, la taxonomía de los grupos es bastante consistente con lo establecido en la literatura (en relación con la enfermedad), a diferencia de los biomarcadores observados aplicando el método a nivel de género. 
+
+Los PMGs no mejoran notablemente la capacidad predictiva del método aplicado a nivel de género. Pero, su capacidad discriminatoria es buena, convirtiéndose en una herramienta válida sobre la cual aplicar métodos de detección de biomarcadores.
+
+Para terminar, recalcar que el método aplicado trata de encontrar balances de grupos. Es decir, no se puede concluir que un determinado OTU sea un biomarcador por si solo. Es el equilibrio entre estos lo que caracteriza si el paciente padece o no la enfermedad (enfoque composicional).
+
+
+
+
+
+
